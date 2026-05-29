@@ -2,27 +2,95 @@
 """
 Maya顶点吸附工具
 使用说明：
-1. 将此文件保存为 vertex_snapper.py
-2. 放到 Maya 的 scripts 文件夹中
-3. 在Maya Script Editor中运行以下代码启动工具：
-
-import vertex_snapper
-reload(vertex_snapper)
-vertex_snapper.show()
-
-或者创建Shelf按钮，使用上面3行代码
+    from ModelTools.xiaota import VertexSnapperTool
+    from importlib import reload
+    reload(VertexSnapperTool)
+    VertexSnapperTool.show()
 """
 
+import traceback
+
 import maya.cmds as mc
+from maya.api import OpenMaya as om
+
+
+# ─────────────────────── 工具函数 ───────────────────────
+
+def _selection_to_verts(long=True):
+    """把当前选择（顶点/边/面/物体）统一转换成扁平顶点列表"""
+    sel = mc.ls(selection=True, flatten=True, long=long) or []
+    if not sel:
+        return []
+    converted = mc.polyListComponentConversion(sel, toVertex=True) or []
+    return mc.ls(converted, flatten=True, long=long) or []
+
+
+def _mesh_world_points(mesh_transform_or_shape):
+    """用 OpenMaya 批量取一个 mesh 的全部世界坐标，返回 [(x,y,z), ...]"""
+    sel = om.MSelectionList()
+    sel.add(mesh_transform_or_shape)
+    dag = sel.getDagPath(0)
+    dag.extendToShape() if dag.apiType() == om.MFn.kTransform else None
+    pts = om.MFnMesh(dag).getPoints(om.MSpace.kWorld)
+    return [(p.x, p.y, p.z) for p in pts]
+
+
+def _vert_world_points(vtx_list):
+    """批量取一组 .vtx[i] 的世界坐标，按 mesh 分组以减少 API 调用"""
+    by_mesh = {}
+    order = []
+    for v in vtx_list:
+        mesh, idx_str = v.rsplit('.vtx[', 1)
+        idx = int(idx_str.rstrip(']'))
+        by_mesh.setdefault(mesh, []).append((idx, len(order)))
+        order.append(None)
+    for mesh, items in by_mesh.items():
+        sel = om.MSelectionList()
+        sel.add(mesh)
+        dag = sel.getDagPath(0)
+        if dag.apiType() == om.MFn.kTransform:
+            dag.extendToShape()
+        pts = om.MFnMesh(dag).getPoints(om.MSpace.kWorld)
+        for idx, slot in items:
+            p = pts[idx]
+            order[slot] = (p.x, p.y, p.z)
+    return order
+
+
+def _nearest_neighbors(target_pts, ref_pts, max_dist=None):
+    """对每个 target_pts 找最近 ref_pts，返回 (closest_pos_list, skipped_indices)
+    超过 max_dist 的目标点会被跳过。"""
+    if not target_pts or not ref_pts:
+        return [None] * len(target_pts), list(range(len(target_pts)))
+
+    max_sq = (max_dist * max_dist) if (max_dist is not None and max_dist > 0) else None
+
+    closest = [None] * len(target_pts)
+    skipped = []
+    for gi, tp in enumerate(target_pts):
+        tx, ty, tz = tp
+        best_d2 = float('inf')
+        best = None
+        for rp in ref_pts:
+            dx = tx - rp[0]; dy = ty - rp[1]; dz = tz - rp[2]
+            d2 = dx * dx + dy * dy + dz * dz
+            if d2 < best_d2:
+                best_d2 = d2
+                best = rp
+        if max_sq is not None and best_d2 > max_sq:
+            skipped.append(gi)
+        else:
+            closest[gi] = best
+    return closest, skipped
 
 class VertexSnapperUI:
     """Maya顶点吸附工具 - 提供自动和手动两种吸附模式"""
     
     def __init__(self):
         self.window_id = "vertexSnapperUIWindow"
-        self.reference_model = None
-        self.verts_to_move = []
-        self.reference_verts = []
+        # source/target 各自为 dict: {"kind": "mesh"|"verts", "value": str | [str, ...]}
+        self.source_data = None
+        self.target_data = None
 
         if mc.window(self.window_id, exists=True):
             mc.deleteUI(self.window_id, window=True)
@@ -30,174 +98,229 @@ class VertexSnapperUI:
 
     def create_ui(self):
         """创建主UI界面"""
-        self.window = mc.window(self.window_id, title="顶点吸附工具", widthHeight=(360, 380), sizeable=True)
-        main_layout = mc.columnLayout(adjustableColumn=True, rowSpacing=5)
-        tabs = mc.tabLayout(innerMarginWidth=5, innerMarginHeight=5)
-        self._create_auto_snap_tab(tabs)
-        self._create_manual_snap_tab(tabs)
-        mc.tabLayout(tabs, edit=True, tabLabel=((self.auto_snap_tab, '自动吸附'), (self.manual_snap_tab, '手动吸附')))
+        self.window = mc.window(self.window_id, title="顶点吸附工具",
+                                widthHeight=(280, 260), sizeable=True)
+        mc.columnLayout(adjustableColumn=True, rowSpacing=8,
+                        columnOffset=('both', 8))
+        mc.separator(height=4, style='none')
+
+        self._frame("源 (提供位置)")
+        self._load_clear_row("加载源模型/顶点", self.load_source, self.clear_source)
+        self.source_field = mc.textField(placeholderText="未加载源", editable=False)
+        mc.setParent('..'); mc.setParent('..')
+
+        self._frame("目标 (要移动顶点)")
+        self._load_clear_row("加载目标模型/顶点", self.load_target, self.clear_target)
+        self.target_field = mc.textField(placeholderText="未加载目标", editable=False)
+        mc.setParent('..'); mc.setParent('..')
+
+        self._frame("选项")
+        self._options_row()
+        mc.button(label="执行吸附", command=self.execute_snap, height=34,
+                  backgroundColor=(0.40, 0.55, 0.40))
+        mc.setParent('..'); mc.setParent('..')
+
+        mc.separator(height=4, style='none')
         mc.showWindow(self.window)
 
-    def _create_auto_snap_tab(self, parent):
-        """创建自动吸附标签页"""
-        self.auto_snap_tab = mc.columnLayout(adjustableColumn=True, rowSpacing=10, parent=parent)
-        mc.frameLayout(label="步骤1: 设置源模型 (提供参考位置)", collapsable=False, marginHeight=10, marginWidth=5)
-        mc.columnLayout(adjustableColumn=True)
-        mc.button(label="加载选中物体为源模型", command=self.load_auto_source_model, height=40)
-        self.auto_source_field = mc.textField(placeholderText="未加载源模型...", editable=False)
+    def _load_clear_row(self, load_label, load_cmd, clear_cmd):
+        """加载 + 清除 的自适应宽度按钮行（加载键随窗口拉伸，清除键固定）"""
+        mc.rowLayout(numberOfColumns=2, adjustableColumn=1,
+                     columnAttach=[(1, 'both', 0), (2, 'both', 4)])
+        mc.button(label=load_label, command=load_cmd, height=28)
+        mc.button(label="清除", width=52, command=clear_cmd, height=28)
         mc.setParent('..')
-        mc.setParent('..')
-        mc.separator(height=10, style='in')
-        mc.frameLayout(label="步骤2: 选择目标顶点并执行吸附", collapsable=False, marginHeight=10, marginWidth=5)
-        mc.columnLayout(adjustableColumn=True)
-        mc.text(label="选择要移动的顶点，点击按钮执行吸附", align="left")
-        mc.button(label="吸附选中顶点到源模型", command=self.execute_auto_snap, height=40, backgroundColor=(0.4, 0.6, 0.4))
-        mc.setParent('..')
-        mc.setParent('..')
-        mc.setParent(parent)
 
-    def _create_manual_snap_tab(self, parent):
-        """创建手动吸附标签页"""
-        self.manual_snap_tab = mc.columnLayout(adjustableColumn=True, rowSpacing=10, parent=parent)
-        mc.frameLayout(label="步骤1: 加载源顶点 (提供目标位置)", collapsable=False, marginHeight=10, marginWidth=5)
-        mc.rowLayout(numberOfColumns=2, columnWidth2=(270, 70))
-        mc.button(label="加载源顶点", command=self.load_manual_reference_verts, height=40)
-        mc.button(label="清除", command=self.clear_manual_reference_verts)
-        mc.setParent('..')
-        self.reference_vtx_field = mc.textField(placeholderText="未加载源顶点...", editable=False)
-        mc.setParent('..')
-        mc.frameLayout(label="步骤2: 加载目标顶点 (要移动的顶点)", collapsable=False, marginHeight=10, marginWidth=5)
-        mc.rowLayout(numberOfColumns=2, columnWidth2=(270, 70))
-        mc.button(label="加载目标顶点", command=self.load_manual_verts_to_move, height=40)
-        mc.button(label="清除", command=self.clear_manual_verts_to_move)
-        mc.setParent('..')
-        self.verts_to_move_field = mc.textField(placeholderText="未加载目标顶点...", editable=False)
-        mc.setParent('..')
-        mc.separator(height=15, style='in')
-        mc.button(label="执行吸附", command=self.execute_manual_snap, height=40, backgroundColor=(0.4, 0.5, 0.65))
-        mc.setParent(parent)
+    def _frame(self, label):
+        """统一样式的分组框"""
+        mc.frameLayout(label=label, collapsable=False, marginHeight=8, marginWidth=8)
+        mc.columnLayout(adjustableColumn=True, rowSpacing=6)
 
-    def load_auto_source_model(self, *args):
-        """加载源模型（自动模式）"""
-        selection = mc.ls(selection=True, type='transform', long=True)
-        if not selection:
-            mc.warning("请选择一个网格物体作为源模型。")
-            return
-        if len(selection) > 1:
-            mc.warning("请只选择一个物体作为源模型。")
-            return
-        source_model = selection[0]
-        shapes = mc.listRelatives(source_model, shapes=True, type='mesh', path=True)
-        if not shapes:
-            mc.warning(f"'{source_model}' 不是一个有效的网格物体。")
-            return
-        self.reference_model = source_model
-        display_name = self.reference_model.split('|')[-1]
-        mc.textField(self.auto_source_field, edit=True, text=display_name)
-        print(f"已加载源模型: {display_name}")
+    def _options_row(self):
+        """选项行：同拓扑勾选 + 最大距离（勾选时最大距离灰显）"""
+        mc.rowLayout(numberOfColumns=2, adjustableColumn=2,
+                     columnAttach=[(1, 'both', 0), (2, 'both', 8)])
+        self.order_check = mc.checkBox(
+            label="同拓扑模式", value=True,
+            changeCommand=self._on_order_toggled,
+            annotation="勾选：第 N 个目标顶点 → 第 N 个源顶点 (要求两边顶点数相同)。"
+                       "不勾选：每个目标顶点吸附到最近的源顶点。")
+        self.max_dist_field = mc.floatFieldGrp(
+            label="最大距离", numberOfFields=1, value1=0.0,
+            columnWidth2=(56, 70), precision=3,
+            annotation="距离阈值，超过则跳过该目标顶点。0 = 不限制。仅在未勾选「同拓扑模式」时生效。")
+        mc.setParent('..')
+        # 初始为勾选，最大距离应灰显
+        self._on_order_toggled(True)
 
-    def execute_auto_snap(self, *args):
-        """执行自动吸附"""
-        if not self.reference_model or not mc.objExists(self.reference_model):
-            mc.warning("未设置源模型或源模型已被删除，请重新加载。")
+    def _on_order_toggled(self, value):
+        """切换同拓扑模式时，灰化/启用最大距离输入框"""
+        mc.floatFieldGrp(self.max_dist_field, edit=True, enable=not value)
+
+    # ─────────── 加载 / 清除 ───────────
+
+    def _resolve_selection(self):
+        """把当前选择归一化成 ('mesh', mesh_long) 或 ('verts', [vtx, ...]) 或 None"""
+        sel = mc.ls(selection=True, long=True) or []
+        if not sel:
+            return None
+
+        comp_kinds = ('.vtx[', '.e[', '.f[', '.map[')
+        if any(k in s for s in sel for k in comp_kinds):
+            verts = _selection_to_verts()
+            return ('verts', verts) if verts else None
+
+        transforms = mc.ls(sel, type='transform', long=True) or []
+        if len(transforms) == 1:
+            shapes = mc.listRelatives(transforms[0], shapes=True, type='mesh', path=True)
+            if shapes:
+                return ('mesh', transforms[0])
+        return None
+
+    def _describe(self, data):
+        if data is None:
+            return ""
+        kind, value = data["kind"], data["value"]
+        if kind == "mesh":
+            return "模型: {}".format(value.split('|')[-1])
+        return "顶点: {} 个".format(len(value))
+
+    def _load_into(self, slot_attr, field_attr, label):
+        resolved = self._resolve_selection()
+        if not resolved:
+            mc.warning(f"请选择一个网格物体或顶点/边/面作为{label}。")
             return
-        target_verts = [v for v in mc.ls(selection=True, flatten=True, long=True) if '.vtx[' in v]
+        kind, value = resolved
+        if kind == "mesh" and len(value) == 0:
+            return
+        if kind == "verts" and not value:
+            return
+        setattr(self, slot_attr, {"kind": kind, "value": value})
+        text = self._describe(getattr(self, slot_attr))
+        mc.textField(getattr(self, field_attr), edit=True, text=text)
+        print(f"已加载{label} - {text}")
+
+    def load_source(self, *args):
+        self._load_into("source_data", "source_field", "源")
+
+    def clear_source(self, *args):
+        self.source_data = None
+        mc.textField(self.source_field, edit=True, text="", placeholderText="未加载源")
+
+    def load_target(self, *args):
+        self._load_into("target_data", "target_field", "目标")
+
+    def clear_target(self, *args):
+        self.target_data = None
+        mc.textField(self.target_field, edit=True, text="", placeholderText="未加载目标")
+
+    # ─────────── 执行 ───────────
+
+    def _resolve_positions(self, data, label):
+        """data → (verts_list_or_None, world_positions_list)"""
+        kind, value = data["kind"], data["value"]
+        if kind == "mesh":
+            if not mc.objExists(value):
+                mc.warning(f"{label}模型已被删除，请重新加载。")
+                return None, None
+            return None, _mesh_world_points(value)
+        # verts
+        alive = [v for v in value if mc.objExists(v)]
+        if not alive:
+            mc.warning(f"{label}顶点已被删除，请重新加载。")
+            return None, None
+        return alive, _vert_world_points(alive)
+
+    def _target_verts(self, data):
+        """目标必须是顶点列表（mesh 转为其全部顶点）"""
+        kind, value = data["kind"], data["value"]
+        if kind == "verts":
+            return [v for v in value if mc.objExists(v)]
+        if not mc.objExists(value):
+            return []
+        shape = mc.listRelatives(value, shapes=True, type='mesh', path=True, fullPath=True)
+        if not shape:
+            return []
+        count = mc.polyEvaluate(value, vertex=True)
+        return mc.ls(f"{value}.vtx[0:{count - 1}]", flatten=True, long=True) or []
+
+    def execute_snap(self, *args):
+        if not self.source_data:
+            mc.warning("请先加载源（模型或顶点）。")
+            return
+        if not self.target_data:
+            mc.warning("请先加载目标（模型或顶点）。")
+            return
+
+        _, ref_positions = self._resolve_positions(self.source_data, "源")
+        if ref_positions is None:
+            return
+
+        target_verts = self._target_verts(self.target_data)
         if not target_verts:
-            mc.warning("请选择要移动的目标顶点。")
+            mc.warning("目标顶点为空或已被删除，请重新加载。")
             return
-        source_verts = mc.ls(f'{self.reference_model}.vtx[*]', flatten=True, long=True)
-        reference_positions = [mc.xform(v, query=True, translation=True, worldSpace=True) for v in source_verts]
-        self._perform_snap_logic(target_verts, reference_positions)
 
-    def load_manual_reference_verts(self, *args):
-        """加载源顶点（手动模式）"""
-        self.reference_verts = [v for v in mc.ls(selection=True, flatten=True, long=True) if '.vtx[' in v]
-        count = len(self.reference_verts)
-        if count > 0:
-            mc.textField(self.reference_vtx_field, edit=True, text=f"已加载 {count} 个源顶点")
-            print(f"已加载 {count} 个源顶点")
+        by_order = mc.checkBox(self.order_check, query=True, value=True)
+        if by_order:
+            if len(ref_positions) != len(target_verts):
+                mc.warning("同拓扑模式要求源/目标顶点数量相等：源 {} 个，目标 {} 个。".format(
+                    len(ref_positions), len(target_verts)))
+                return
+            self._perform_snap_logic(target_verts, ref_positions, paired=True)
         else:
-            mc.warning("未选择任何顶点。")
-        
-    def clear_manual_reference_verts(self, *args):
-        """清除源顶点"""
-        self.reference_verts = []
-        mc.textField(self.reference_vtx_field, edit=True, text="", placeholderText="未加载源顶点...")
+            max_dist = mc.floatFieldGrp(self.max_dist_field, query=True, value1=True)
+            self._perform_snap_logic(target_verts, ref_positions, max_dist=max_dist)
 
-    def load_manual_verts_to_move(self, *args):
-        """加载目标顶点（手动模式）"""
-        self.verts_to_move = [v for v in mc.ls(selection=True, flatten=True, long=True) if '.vtx[' in v]
-        count = len(self.verts_to_move)
-        if count > 0:
-            mc.textField(self.verts_to_move_field, edit=True, text=f"已加载 {count} 个目标顶点")
-            print(f"已加载 {count} 个目标顶点")
+    def _perform_snap_logic(self, verts_to_move, reference_positions, max_dist=None, paired=False):
+        """执行顶点吸附的核心逻辑。
+        paired=True 时按 index 一一对应；否则对每个目标顶点找最近源顶点。
+        max_dist>0 时跳过超过该距离的目标顶点（仅最近邻模式）。"""
+        verts = [v for v in verts_to_move if mc.objExists(v)]
+        if not verts:
+            mc.warning("未处理任何有效的顶点。")
+            return
+
+        if paired:
+            targets = reference_positions[:len(verts)]
+            skipped = []
         else:
-            mc.warning("未选择任何顶点。")
+            target_positions = _vert_world_points(verts)
+            targets, skipped = _nearest_neighbors(target_positions, reference_positions, max_dist=max_dist)
 
-    def clear_manual_verts_to_move(self, *args):
-        """清除目标顶点"""
-        self.verts_to_move = []
-        mc.textField(self.verts_to_move_field, edit=True, text="", placeholderText="未加载目标顶点...")
-    
-    def execute_manual_snap(self, *args):
-        """执行手动吸附"""
-        if not self.reference_verts:
-            mc.warning("未加载源顶点，请先执行步骤1。")
-            return
-        if not self.verts_to_move:
-            mc.warning("未加载目标顶点，请先执行步骤2。")
-            return
-        if not mc.objExists(self.reference_verts[0]):
-            mc.warning("源顶点已被删除，请重新加载。")
-            return
-        if not mc.objExists(self.verts_to_move[0]):
-            mc.warning("目标顶点已被删除，请重新加载。")
-            return
-        reference_positions = [mc.xform(v, query=True, translation=True, worldSpace=True) for v in self.reference_verts]
-        self._perform_snap_logic(self.verts_to_move, reference_positions)
-
-    def _perform_snap_logic(self, verts_to_move, reference_positions):
-        """执行顶点吸附的核心逻辑"""
+        moved = 0
+        opened = False
         try:
             mc.undoInfo(openChunk=True)
-            processed_count = 0
-            for vtx_to_move in verts_to_move:
-                if not mc.objExists(vtx_to_move):
+            opened = True
+            for vtx, dest in zip(verts, targets):
+                if dest is None:
                     continue
-                current_pos = mc.xform(vtx_to_move, query=True, translation=True, worldSpace=True)
-                min_distance_squared = float('inf')
-                closest_ref_pos = None
-                for ref_pos in reference_positions:
-                    dist_sq = sum([(a - b) ** 2 for a, b in zip(current_pos, ref_pos)])
-                    if dist_sq < min_distance_squared:
-                        min_distance_squared = dist_sq
-                        closest_ref_pos = ref_pos
-                if closest_ref_pos:
-                    mc.move(closest_ref_pos[0], closest_ref_pos[1], closest_ref_pos[2], vtx_to_move, worldSpace=True, absolute=True)
-                    processed_count += 1
-            if processed_count > 0:
-                print(f"✓ 吸附完成！成功移动了 {processed_count} 个顶点。")
-            else:
-                mc.warning("未处理任何有效的顶点。")
-        except Exception as e:
-            mc.error(f"吸附过程中发生错误: {str(e)}")
+                mc.move(dest[0], dest[1], dest[2], vtx, worldSpace=True, absolute=True)
+                moved += 1
+        except Exception:
+            mc.warning("吸附过程中发生错误，详见 Script Editor。")
+            print(traceback.format_exc())
         finally:
-            mc.undoInfo(closeChunk=True)
+            if opened:
+                mc.undoInfo(closeChunk=True)
+
+        msg = "吸附完成：移动 {} 个顶点".format(moved)
+        if skipped:
+            msg += "，跳过 {} 个（超出最大距离）".format(len(skipped))
+        if moved == 0:
+            mc.warning(msg)
+        else:
+            print(msg)
+            try:
+                mc.inViewMessage(amg=msg, pos="midCenter", fade=True)
+            except RuntimeError:
+                pass
 
 # 全局函数，用于启动工具
 def show():
     """启动顶点吸附工具"""
     global vertex_snapper_tool
-    try:
-        vertex_snapper_tool
-    except:
-        pass
-    else:
-        try:
-            if mc.window(vertex_snapper_tool.window_id, exists=True):
-                mc.deleteUI(vertex_snapper_tool.window_id, window=True)
-        except:
-            pass
     vertex_snapper_tool = VertexSnapperUI()
     return vertex_snapper_tool
 
